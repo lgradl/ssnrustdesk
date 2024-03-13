@@ -134,7 +134,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
               )
             ],
           )),
-    ).paddingOnly(right: bind.isQs() ? 8 : 0);
+    ).paddingOnly(right: bind.isIncomingOnly() ? 8 : 0);
   }
 
   updateStatus() async {
@@ -417,6 +417,9 @@ class _ConnectionPageState extends State<ConnectionPage>
                           inputFormatters: [IDTextInputFormatter()],
                           onChanged: (v) {
                             _idController.id = v;
+                          },
+                          onSubmitted: (_) {
+                            onConnect();
                           },
                         ));
                   },
