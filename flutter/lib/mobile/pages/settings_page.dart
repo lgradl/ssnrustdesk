@@ -27,7 +27,7 @@ class SettingsPage extends StatefulWidget implements PageShape {
   final icon = Icon(Icons.settings);
 
   @override
-  final appBarActions = [ScanButton()];
+  final appBarActions = bind.isDisableSettings() ? [] : [ScanButton()];
 
   @override
   State<SettingsPage> createState() => _SettingsState();
@@ -44,6 +44,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _onlyWhiteList = false;
   var _enableDirectIPAccess = false;
   var _enableRecordSession = false;
+  var _enableHardwareCodec = false;
   var _autoRecordIncomingSession = false;
   var _allowAutoDisconnect = false;
   var _localIP = "";
@@ -118,6 +119,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       if (enableRecordSession != _enableRecordSession) {
         update = true;
         _enableRecordSession = enableRecordSession;
+      }
+
+      final enableHardwareCodec = option2bool(
+          'enable-hwcodec', await bind.mainGetOption(key: 'enable-hwcodec'));
+      if (_enableHardwareCodec != enableHardwareCodec) {
+        update = true;
+        _enableHardwareCodec = enableHardwareCodec;
       }
 
       final autoRecordIncomingSession = option2bool(
@@ -218,6 +226,21 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     Provider.of<FfiModel>(context);
+    final outgoingOnly = bind.isOutgoingOnly();
+    final customClientSection = CustomSettingsSection(
+        child: Column(
+      children: [
+        if (bind.isCustomClient())
+          Align(
+            alignment: Alignment.center,
+            child: loadPowered(context),
+          ),
+        Align(
+          alignment: Alignment.center,
+          child: loadLogo(),
+        )
+      ],
+    ));
     final List<AbstractSettingsTile> enhancementsTiles = [];
     final List<AbstractSettingsTile> shareScreenTiles = [
       SettingsTile.switchTile(
@@ -448,33 +471,37 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           gFFI.invokeMethod(AndroidChannel.kSetStartOnBootOpt, toValue);
         }));
 
-    return SettingsList(
+    final disabledSettings = bind.isDisableSettings();
+    final settings = SettingsList(
       sections: [
-        SettingsSection(
-          title: Text(translate('Account')),
-          tiles: [
-            SettingsTile(
-              title: Obx(() => Text(gFFI.userModel.userName.value.isEmpty
-                  ? translate('Login')
-                  : '${translate('Logout')} (${gFFI.userModel.userName.value})')),
-              leading: Icon(Icons.person),
-              onPressed: (context) {
-                if (gFFI.userModel.userName.value.isEmpty) {
-                  loginDialog();
-                } else {
-                  logOutConfirmDialog();
-                }
-              },
-            ),
-          ],
-        ),
+        customClientSection,
+        if (!bind.isDisableAccount())
+          SettingsSection(
+            title: Text(translate('Account')),
+            tiles: [
+              SettingsTile(
+                title: Obx(() => Text(gFFI.userModel.userName.value.isEmpty
+                    ? translate('Login')
+                    : '${translate('Logout')} (${gFFI.userModel.userName.value})')),
+                leading: Icon(Icons.person),
+                onPressed: (context) {
+                  if (gFFI.userModel.userName.value.isEmpty) {
+                    loginDialog();
+                  } else {
+                    logOutConfirmDialog();
+                  }
+                },
+              ),
+            ],
+          ),
         SettingsSection(title: Text(translate("Settings")), tiles: [
-          SettingsTile(
-              title: Text(translate('ID/Relay Server')),
-              leading: Icon(Icons.cloud),
-              onPressed: (context) {
-                showServerSettings(gFFI.dialogManager);
-              }),
+          if (!disabledSettings)
+            SettingsTile(
+                title: Text(translate('ID/Relay Server')),
+                leading: Icon(Icons.cloud),
+                onPressed: (context) {
+                  showServerSettings(gFFI.dialogManager);
+                }),
           SettingsTile(
               title: Text(translate('Language')),
               leading: Icon(Icons.translate),
@@ -495,6 +522,22 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           )
         ]),
         if (isAndroid)
+          SettingsSection(title: Text(translate('Hardware Codec')), tiles: [
+            SettingsTile.switchTile(
+              title: Text(translate('Enable hardware codec')),
+              initialValue: _enableHardwareCodec,
+              onToggle: (v) async {
+                await bind.mainSetOption(
+                    key: "enable-hwcodec", value: v ? "" : "N");
+                final newValue =
+                    await bind.mainGetOption(key: "enable-hwcodec") != "N";
+                setState(() {
+                  _enableHardwareCodec = newValue;
+                });
+              },
+            ),
+          ]),
+        if (isAndroid && !outgoingOnly)
           SettingsSection(
             title: Text(translate("Recording")),
             tiles: [
@@ -506,7 +549,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     builder: (ctx, data) => Offstage(
                         offstage: !data.hasData,
                         child: Text("${translate("Directory")}: ${data.data}")),
-                    future: bind.mainDefaultVideoSaveDirectory()),
+                    future: bind.mainVideoSaveDirectory(root: false)),
                 initialValue: _autoRecordIncomingSession,
                 onToggle: (v) async {
                   await bind.mainSetOption(
@@ -523,13 +566,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               ),
             ],
           ),
-        if (isAndroid)
+        if (isAndroid && !disabledSettings && !outgoingOnly)
           SettingsSection(
             title: Text(translate("Share Screen")),
             tiles: shareScreenTiles,
           ),
-        defaultDisplaySection(),
-        if (isAndroid)
+        if (!bind.isIncomingOnly()) defaultDisplaySection(),
+        if (isAndroid && !disabledSettings && !outgoingOnly)
           SettingsSection(
             title: Text(translate("Enhancements")),
             tiles: enhancementsTiles,
@@ -578,6 +621,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         ),
       ],
     );
+    return settings;
   }
 
   Future<bool> canStartOnBoot() async {

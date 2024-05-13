@@ -281,6 +281,10 @@ pub struct PeerConfig {
     pub enable_file_transfer: EnableFileTransfer,
     #[serde(flatten)]
     pub show_quality_monitor: ShowQualityMonitor,
+    #[serde(flatten)]
+    pub follow_remote_cursor: FollowRemoteCursor,
+    #[serde(flatten)]
+    pub follow_remote_window: FollowRemoteWindow,
     #[serde(
         default,
         deserialize_with = "deserialize_string",
@@ -317,7 +321,11 @@ pub struct PeerConfig {
     pub custom_resolutions: HashMap<String, Resolution>,
 
     // The other scalar value must before this
-    #[serde(default, deserialize_with = "PeerConfig::deserialize_options")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_hashmap_string_string",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub options: HashMap<String, String>, // not use delete to represent default values
     // Various data for flutter ui
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
@@ -349,6 +357,8 @@ impl Default for PeerConfig {
             disable_clipboard: Default::default(),
             enable_file_transfer: Default::default(),
             show_quality_monitor: Default::default(),
+            follow_remote_cursor: Default::default(),
+            follow_remote_window: Default::default(),
             keyboard_mode: Default::default(),
             view_only: Default::default(),
             reverse_mouse_wheel: Self::default_reverse_mouse_wheel(),
@@ -402,21 +412,11 @@ fn patch(path: PathBuf) -> PathBuf {
         #[cfg(target_os = "linux")]
         {
             if _tmp == "/root" {
-                if let Ok(output) = std::process::Command::new("whoami").output() {
-                    let user = String::from_utf8_lossy(&output.stdout)
-                        .to_string()
-                        .trim()
-                        .to_owned();
+                if let Ok(user) = crate::platform::linux::run_cmds_trim_newline("whoami") {
                     if user != "root" {
                         let cmd = format!("getent passwd '{}' | awk -F':' '{{print $6}}'", user);
-                        if let Ok(output) = std::process::Command::new(cmd).output() {
-                            let home_dir = String::from_utf8_lossy(&output.stdout)
-                                .to_string()
-                                .trim()
-                                .to_owned();
-                            if !home_dir.is_empty() {
-                                return home_dir.into();
-                            }
+                        if let Ok(output) = crate::platform::linux::run_cmds_trim_newline(&cmd) {
+                            return output.into();
                         }
                         return format!("/home/{user}").into();
                     }
@@ -509,7 +509,7 @@ impl Config {
     fn store_<T: serde::Serialize>(config: &T, suffix: &str) {
         let file = Self::file_(suffix);
         if let Err(err) = store_path(file, config) {
-            log::error!("Failed to store config: {}", err);
+            log::error!("Failed to store {suffix} config: {err}");
         }
     }
 
@@ -873,6 +873,7 @@ impl Config {
         }
         let mut config = Config::load_::<Config>("");
         if config.key_pair.0.is_empty() {
+            log::info!("Generated new keypair for id: {}", config.id);
             let (pk, sk) = sign::gen_keypair();
             let key_pair = (sk.0.to_vec(), pk.0.into());
             config.key_pair = key_pair.clone();
@@ -913,7 +914,13 @@ impl Config {
         res
     }
 
-    pub fn set_options(v: HashMap<String, String>) {
+    #[inline]
+    fn purify_options(v: &mut HashMap<String, String>) {
+        v.retain(|k, v| is_option_can_save(&OVERWRITE_SETTINGS, &DEFAULT_SETTINGS, k, v));
+    }
+
+    pub fn set_options(mut v: HashMap<String, String>) {
+        Self::purify_options(&mut v);
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
             return;
@@ -933,6 +940,9 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        if !is_option_can_save(&OVERWRITE_SETTINGS, &DEFAULT_SETTINGS, &k, &v) {
+            return;
+        }
         let mut config = CONFIG2.write().unwrap();
         let v2 = if v.is_empty() { None } else { Some(&v) };
         if v2 != config.options.get(&k) {
@@ -955,6 +965,14 @@ impl Config {
     }
 
     pub fn set_permanent_password(password: &str) {
+        if HARD_SETTINGS
+            .read()
+            .unwrap()
+            .get("password")
+            .map_or(false, |v| v == password)
+        {
+            return;
+        }
         let mut config = CONFIG.write().unwrap();
         if password == config.password {
             return;
@@ -1002,6 +1020,11 @@ impl Config {
 
     pub fn get_socks() -> Option<Socks5Server> {
         CONFIG2.read().unwrap().socks.clone()
+    }
+
+    #[inline]
+    pub fn is_proxy() -> bool {
+        Self::get_network_type() != NetworkType::Direct
     }
 
     pub fn get_network_type() -> NetworkType {
@@ -1218,22 +1241,8 @@ impl PeerConfig {
         }
     }
 
-    fn deserialize_options<'de, D>(deserializer: D) -> Result<HashMap<String, String>, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        let mut mp: HashMap<String, String> = de::Deserialize::deserialize(deserializer)?;
-        Self::insert_default_options(&mut mp);
-        Ok(mp)
-    }
-
     fn default_options() -> HashMap<String, String> {
         let mut mp: HashMap<String, String> = Default::default();
-        Self::insert_default_options(&mut mp);
-        return mp;
-    }
-
-    fn insert_default_options(mp: &mut HashMap<String, String>) {
         [
             "codec-preference",
             "custom-fps",
@@ -1243,10 +1252,9 @@ impl PeerConfig {
             "swap-left-right-mouse",
         ]
         .map(|key| {
-            if !mp.contains_key(key) {
-                mp.insert(key.to_owned(), UserDefaultConfig::read(key));
-            }
+            mp.insert(key.to_owned(), UserDefaultConfig::read(key));
         });
+        mp
     }
 }
 
@@ -1255,6 +1263,19 @@ serde_field_bool!(
     "show_remote_cursor",
     default_show_remote_cursor,
     "ShowRemoteCursor::default_show_remote_cursor"
+);
+serde_field_bool!(
+    FollowRemoteCursor,
+    "follow_remote_cursor",
+    default_follow_remote_cursor,
+    "FollowRemoteCursor::default_follow_remote_cursor"
+);
+
+serde_field_bool!(
+    FollowRemoteWindow,
+    "follow_remote_window",
+    default_follow_remote_window,
+    "FollowRemoteWindow::default_follow_remote_window"
 );
 serde_field_bool!(
     ShowQualityMonitor,
@@ -1394,6 +1415,9 @@ impl LocalConfig {
     }
 
     pub fn set_option(k: String, v: String) {
+        if !is_option_can_save(&OVERWRITE_LOCAL_SETTINGS, &DEFAULT_LOCAL_SETTINGS, &k, &v) {
+            return;
+        }
         let mut config = LOCAL_CONFIG.write().unwrap();
         let v2 = if v.is_empty() { None } else { Some(&v) };
         if v2 != config.options.get(&k) {
@@ -1488,8 +1512,10 @@ impl LanPeers {
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct HwCodecConfig {
-    #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
-    pub options: HashMap<String, String>,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub ram: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub vram: String,
 }
 
 impl HwCodecConfig {
@@ -1504,25 +1530,17 @@ impl HwCodecConfig {
     pub fn clear() {
         HwCodecConfig::default().store();
     }
-}
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct GpucodecConfig {
-    #[serde(default, deserialize_with = "deserialize_string")]
-    pub available: String,
-}
-
-impl GpucodecConfig {
-    pub fn load() -> GpucodecConfig {
-        Config::load_::<GpucodecConfig>("_gpucodec")
+    pub fn clear_ram() {
+        let mut c = Self::load();
+        c.ram = Default::default();
+        c.store();
     }
 
-    pub fn store(&self) {
-        Config::store_(self, "_gpucodec");
-    }
-
-    pub fn clear() {
-        GpucodecConfig::default().store();
+    pub fn clear_vram() {
+        let mut c = Self::load();
+        c.vram = Default::default();
+        c.store();
     }
 }
 
@@ -1562,6 +1580,7 @@ impl UserDefaultConfig {
             }
             "custom_image_quality" => self.get_double_string(key, 50.0, 10.0, 0xFFF as f64),
             "custom-fps" => self.get_double_string(key, 30.0, 5.0, 120.0),
+            "enable_file_transfer" => self.get_string(key, "Y", vec![""]),
             _ => self
                 .get_after(key)
                 .map(|v| v.to_string())
@@ -1570,6 +1589,14 @@ impl UserDefaultConfig {
     }
 
     pub fn set(&mut self, key: String, value: String) {
+        if !is_option_can_save(
+            &OVERWRITE_DISPLAY_SETTINGS,
+            &DEFAULT_DISPLAY_SETTINGS,
+            &key,
+            &value,
+        ) {
+            return;
+        }
         if value.is_empty() {
             self.options.remove(&key);
         } else {
@@ -1660,13 +1687,19 @@ pub struct AbPeer {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct Ab {
+pub struct AbEntry {
     #[serde(
         default,
         deserialize_with = "deserialize_string",
         skip_serializing_if = "String::is_empty"
     )]
-    pub access_token: String,
+    pub guid: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub name: String,
     #[serde(default, deserialize_with = "deserialize_vec_abpeer")]
     pub peers: Vec<AbPeer>,
     #[serde(default, deserialize_with = "deserialize_vec_string")]
@@ -1677,6 +1710,24 @@ pub struct Ab {
         skip_serializing_if = "String::is_empty"
     )]
     pub tag_colors: String,
+}
+
+impl AbEntry {
+    pub fn personal(&self) -> bool {
+        self.name == "My address book" || self.name == "Legacy address book"
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct Ab {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_string",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub access_token: String,
+    #[serde(default, deserialize_with = "deserialize_vec_abentry")]
+    pub ab_entries: Vec<AbEntry>,
 }
 
 impl Ab {
@@ -1691,6 +1742,7 @@ impl Ab {
             let max_len = 64 * 1024 * 1024;
             if data.len() > max_len {
                 // maxlen of function decompress
+                log::error!("ab data too large, {} > {}", data.len(), max_len);
                 return;
             }
             if let Ok(data) = symmetric_crypt(&data, true) {
@@ -1840,6 +1892,7 @@ deserialize_default!(deserialize_vec_string, Vec<String>);
 deserialize_default!(deserialize_vec_i32_string_i32, Vec<(i32, String, i32)>);
 deserialize_default!(deserialize_vec_discoverypeer, Vec<DiscoveryPeer>);
 deserialize_default!(deserialize_vec_abpeer, Vec<AbPeer>);
+deserialize_default!(deserialize_vec_abentry, Vec<AbEntry>);
 deserialize_default!(deserialize_vec_groupuser, Vec<GroupUser>);
 deserialize_default!(deserialize_vec_grouppeer, Vec<GroupPeer>);
 deserialize_default!(deserialize_keypair, KeyPair);
@@ -1861,6 +1914,22 @@ fn get_or(
         .or(b.get(k))
         .or(c.read().unwrap().get(k))
         .cloned()
+}
+
+#[inline]
+fn is_option_can_save(
+    overwrite: &RwLock<HashMap<String, String>>,
+    defaults: &RwLock<HashMap<String, String>>,
+    k: &str,
+    v: &str,
+) -> bool {
+    if overwrite.read().unwrap().contains_key(k) {
+        return false;
+    }
+    if defaults.read().unwrap().get(k).map_or(false, |x| x == v) {
+        return false;
+    }
+    true
 }
 
 #[inline]
@@ -1957,6 +2026,33 @@ mod tests {
             .write()
             .unwrap()
             .insert("d".to_string(), "c".to_string());
+        let mut res: HashMap<String, String> = Default::default();
+        res.insert("b".to_owned(), "c".to_string());
+        res.insert("d".to_owned(), "c".to_string());
+        res.insert("c".to_owned(), "a".to_string());
+        Config::purify_options(&mut res);
+        assert!(res.len() == 0);
+        res.insert("b".to_owned(), "c".to_string());
+        res.insert("d".to_owned(), "c".to_string());
+        res.insert("c".to_owned(), "a".to_string());
+        res.insert("f".to_owned(), "a".to_string());
+        Config::purify_options(&mut res);
+        assert!(res.len() == 1);
+        res.insert("b".to_owned(), "c".to_string());
+        res.insert("d".to_owned(), "c".to_string());
+        res.insert("c".to_owned(), "a".to_string());
+        res.insert("f".to_owned(), "a".to_string());
+        res.insert("c".to_owned(), "d".to_string());
+        Config::purify_options(&mut res);
+        assert!(res.len() == 2);
+        res.insert("b".to_owned(), "c".to_string());
+        res.insert("d".to_owned(), "c".to_string());
+        res.insert("c".to_owned(), "a".to_string());
+        res.insert("f".to_owned(), "a".to_string());
+        res.insert("c".to_owned(), "d".to_string());
+        res.insert("d".to_owned(), "cc".to_string());
+        Config::purify_options(&mut res);
+        assert!(res.len() == 2);
         let res = Config::get_options();
         assert!(res["a"] == "b");
         assert!(res["c"] == "a");
