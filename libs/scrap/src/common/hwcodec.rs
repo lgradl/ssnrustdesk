@@ -46,12 +46,10 @@ pub struct HwRamEncoderConfig {
 
 pub struct HwRamEncoder {
     encoder: Encoder,
-    name: String,
     pub format: DataFormat,
     pub pixfmt: AVPixelFormat,
-    width: u32,
-    height: u32,
     bitrate: u32, //kbs
+    config: HwRamEncoderConfig,
 }
 
 impl EncoderApi for HwRamEncoder {
@@ -67,7 +65,7 @@ impl EncoderApi for HwRamEncoder {
                 if base_bitrate <= 0 {
                     bitrate = base_bitrate;
                 }
-                bitrate = Self::check_bitrate_range(&config.name, bitrate);
+                bitrate = Self::check_bitrate_range(&config, bitrate);
                 let gop = config.keyframe_interval.unwrap_or(DEFAULT_GOP as _) as i32;
                 let ctx = EncodeContext {
                     name: config.name.clone(),
@@ -95,12 +93,10 @@ impl EncoderApi for HwRamEncoder {
                 match Encoder::new(ctx.clone()) {
                     Ok(encoder) => Ok(HwRamEncoder {
                         encoder,
-                        name: config.name,
                         format,
                         pixfmt: ctx.pixfmt,
-                        width: ctx.width as _,
-                        height: ctx.height as _,
                         bitrate,
+                        config,
                     }),
                     Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
@@ -172,10 +168,10 @@ impl EncoderApi for HwRamEncoder {
     }
 
     fn set_quality(&mut self, quality: crate::codec::Quality) -> ResultType<()> {
-        let b = Self::convert_quality(&self.name, quality);
-        let mut bitrate = base_bitrate(self.width as _, self.height as _) * b / 100;
+        let b = Self::convert_quality(&self.config.name, quality);
+        let mut bitrate = base_bitrate(self.config.width as _, self.config.height as _) * b / 100;
         if bitrate > 0 {
-            bitrate = Self::check_bitrate_range(&self.name, bitrate);
+            bitrate = Self::check_bitrate_range(&self.config, self.bitrate);
             self.encoder.set_bitrate(bitrate as _).ok();
             self.bitrate = bitrate;
         }
@@ -189,17 +185,17 @@ impl EncoderApi for HwRamEncoder {
     fn support_abr(&self) -> bool {
         ["qsv", "vaapi", "mediacodec"]
             .iter()
-            .all(|&x| !self.name.contains(x))
+            .all(|&x| !self.config.name.contains(x))
     }
 
     fn support_changing_quality(&self) -> bool {
         ["vaapi", "mediacodec"]
             .iter()
-            .all(|&x| !self.name.contains(x))
+            .all(|&x| !self.config.name.contains(x))
     }
 
     fn latency_free(&self) -> bool {
-        !self.name.contains("mediacodec")
+        !self.config.name.contains("mediacodec")
     }
 }
 
@@ -256,17 +252,23 @@ impl HwRamEncoder {
         quality * factor
     }
 
-    pub fn check_bitrate_range(name: &str, bitrate: u32) -> u32 {
+    pub fn check_bitrate_range(config: &HwRamEncoderConfig, bitrate: u32) -> u32 {
         #[cfg(target_os = "android")]
-        if name.contains("mediacodec") {
+        if config.name.contains("mediacodec") {
             let info = crate::android::ffi::get_codec_info();
             if let Some(info) = info {
-                if let Some(codec) = info.codecs.iter().find(|c| c.name == name && c.is_encoder) {
-                    if bitrate > codec.max_bitrate {
-                        return codec.max_bitrate;
-                    }
-                    if bitrate < codec.min_bitrate {
-                        return codec.min_bitrate;
+                if let Some(codec) = info
+                    .codecs
+                    .iter()
+                    .find(|c| Some(c.name.clone()) == config.mc_name && c.is_encoder)
+                {
+                    if codec.max_bitrate > codec.min_bitrate {
+                        if bitrate > codec.max_bitrate {
+                            return codec.max_bitrate;
+                        }
+                        if bitrate < codec.min_bitrate {
+                            return codec.min_bitrate;
+                        }
                     }
                 }
             }
@@ -416,6 +418,7 @@ fn get_config() -> ResultType<Available> {
     #[cfg(target_os = "android")]
     {
         let info = crate::android::ffi::get_codec_info();
+        log::info!("all codec info: {info:?}");
         struct T {
             name_prefix: &'static str,
             data_format: DataFormat,
@@ -440,16 +443,26 @@ fn get_config() -> ResultType<Available> {
                         c.is_encoder
                             && c.mime_type.as_str() == get_mime_type(t.data_format)
                             && c.nv12
+                            && c.hw == Some(true) //only use hardware codec
                     })
                     .collect();
                 log::debug!("available {:?} encoders: {codecs:?}", t.data_format);
+                let screen_wh = std::cmp::max(info.w, info.h);
                 let mut best = None;
-                if let Some(c) = codecs.iter().find(|c| c.hw == Some(true)) {
-                    best = Some(c.name.clone());
-                } else if let Some(c) = codecs.iter().find(|c| c.hw == None) {
-                    best = Some(c.name.clone());
-                } else if let Some(c) = codecs.first() {
-                    best = Some(c.name.clone());
+                if let Some(codec) = codecs
+                    .iter()
+                    .find(|c| c.max_width >= screen_wh && c.max_height >= screen_wh)
+                {
+                    best = Some(codec.name.clone());
+                } else {
+                    // find the max resolution
+                    let mut max_area = 0;
+                    for codec in codecs.iter() {
+                        if codec.max_width * codec.max_height > max_area {
+                            best = Some(codec.name.clone());
+                            max_area = codec.max_width * codec.max_height;
+                        }
+                    }
                 }
                 if let Some(best) = best {
                     e.push(CodecInfo {

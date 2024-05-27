@@ -42,6 +42,9 @@ class MainActivity : FlutterActivity() {
     private val logTag = "mMainActivity"
     private var mainService: MainService? = null
 
+    private var isAudioStart = false
+    private val audioRecordHandle = AudioRecordHandle(this, { false }, { isAudioStart })
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         if (MainService.isReady) {
@@ -230,6 +233,12 @@ class MainActivity : FlutterActivity() {
                         result.success(false)
                     }
                 }
+                "on_voice_call_started" -> {
+                    onVoiceCallStarted()
+                }
+                "on_voice_call_closed" -> {
+                    onVoiceCallClosed()
+                }
                 else -> {
                     result.error("-1", "No such method", null)
                 }
@@ -256,6 +265,9 @@ class MainActivity : FlutterActivity() {
             w = dm.widthPixels
             h = dm.heightPixels
         }
+        val align = 64
+        w = (w + align - 1) / align * align
+        h = (h + align - 1) / align * align
         codecs.forEach { codec ->
             val codecObject = JSONObject()
             codecObject.put("name", codec.name)
@@ -264,24 +276,31 @@ class MainActivity : FlutterActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 hw = codec.isHardwareAccelerated
             } else {
-                if (listOf("OMX.google.", "OMX.SEC.", "c2.android").any { codec.name.startsWith(it) }) {
+                // https://chromium.googlesource.com/external/webrtc/+/HEAD/sdk/android/src/java/org/webrtc/MediaCodecUtils.java#29
+                // https://chromium.googlesource.com/external/webrtc/+/master/sdk/android/api/org/webrtc/HardwareVideoEncoderFactory.java#229
+                if (listOf("OMX.google.", "OMX.SEC.", "c2.android").any { codec.name.startsWith(it, true) }) {
                     hw = false
+                } else if (listOf("c2.qti", "OMX.qcom.video", "OMX.Exynos", "OMX.hisi", "OMX.MTK", "OMX.Intel", "OMX.Nvidia").any { codec.name.startsWith(it, true) }) {
+                    hw = true
                 }
+            }
+            if (hw != true) {
+                return@forEach
             }
             codecObject.put("hw", hw)
             var mime_type = ""
             codec.supportedTypes.forEach { type ->
-                if (listOf("video/avc", "video/hevc", "video/x-vnd.on2.vp8", "video/x-vnd.on2.vp9", "video/av01").contains(type)) {
+                if (listOf("video/avc", "video/hevc").contains(type)) { // "video/x-vnd.on2.vp8", "video/x-vnd.on2.vp9", "video/av01"
                     mime_type = type;
                 }
             }
             if (mime_type.isNotEmpty()) {
                 codecObject.put("mime_type", mime_type)
                 val caps = codec.getCapabilitiesForType(mime_type)
-                var usable = true;
                 if (codec.isEncoder) {
-                    if (!caps.videoCapabilities.isSizeSupported(w,h) || !caps.videoCapabilities.isSizeSupported(h,w)) {
-                        usable = false
+                    // Encoder‘s max_height and max_width are interchangeable
+                    if (!caps.videoCapabilities.isSizeSupported(w,h) && !caps.videoCapabilities.isSizeSupported(h,w)) {
+                        return@forEach
                     }
                 }
                 codecObject.put("min_width", caps.videoCapabilities.supportedWidths.lower)
@@ -293,7 +312,7 @@ class MainActivity : FlutterActivity() {
                 val nv12 = caps.colorFormats.contains(COLOR_FormatYUV420SemiPlanar)
                 codecObject.put("nv12", nv12)
                 if (!(nv12 || surface)) {
-                    usable = false
+                    return@forEach
                 }
                 codecObject.put("min_bitrate", caps.videoCapabilities.bitrateRange.lower / 1000)
                 codecObject.put("max_bitrate", caps.videoCapabilities.bitrateRange.upper / 1000)
@@ -302,14 +321,57 @@ class MainActivity : FlutterActivity() {
                         codecObject.put("low_latency", caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency))
                     }
                 }
-                if (usable) {
-                    codecArray.put(codecObject)
+                if (!codec.isEncoder) {
+                    return@forEach
                 }
+                codecArray.put(codecObject)
             }
         }
         val result = JSONObject()
         result.put("version", Build.VERSION.SDK_INT)
+        result.put("w", w)
+        result.put("h", h)
         result.put("codecs", codecArray)
         FFI.setCodecInfo(result.toString())
+    }
+
+    private fun onVoiceCallStarted() {
+        var ok = false
+        mainService?.let {
+            ok = it.onVoiceCallStarted()
+        } ?: let {
+            isAudioStart = true
+            ok = audioRecordHandle.onVoiceCallStarted(null)
+        }
+        if (!ok) {
+            // Rarely happens, So we just add log and msgbox here.
+            Log.e(logTag, "onVoiceCallStarted fail")
+            flutterMethodChannel?.invokeMethod("msgbox", mapOf(
+                "type" to "custom-nook-nocancel-hasclose-error",
+                "title" to "Voice call",
+                "text" to "Failed to start voice call."))
+        } else {
+            Log.d(logTag, "onVoiceCallStarted success")
+        }
+    }
+
+    private fun onVoiceCallClosed() {
+        var ok = false
+        mainService?.let {
+            ok = it.onVoiceCallClosed()
+        } ?: let {
+            isAudioStart = false
+            ok = audioRecordHandle.onVoiceCallClosed(null)
+        }
+        if (!ok) {
+            // Rarely happens, So we just add log and msgbox here.
+            Log.e(logTag, "onVoiceCallClosed fail")
+            flutterMethodChannel?.invokeMethod("msgbox", mapOf(
+                "type" to "custom-nook-nocancel-hasclose-error",
+                "title" to "Voice call",
+                "text" to "Failed to stop voice call."))
+        } else {
+            Log.d(logTag, "onVoiceCallClosed success")
+        }
     }
 }
